@@ -20,29 +20,28 @@ static int testmod_open( struct inode*, struct file* );
 static int testmod_release( struct inode*, struct file* );
 static ssize_t testmod_read( struct file*, char*, size_t, loff_t* );
 static ssize_t testmod_write( struct file*, const char*, size_t, loff_t* );
+static void testmod_cleanup_module(void);
 long testmod_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 #define DEVICE_NAME "testmod" /* name shown in /proc/devices */
 #define CLASS_NAME "testmod"
+#define TESTMOD_MAJOR 0      /* dynamic major by default */
+#define TESTMOD_NR_DEVS 3    /* testmod0 through testmod3 */
+#define BUFFER_SIZE 1024   /* requirement */
+/* IOCTL */
+#define TESTMOD_IOC_MAGIC  82
+#define TESTMOD_IOCBUFFERRESET    _IO(TESTMOD_IOC_MAGIC, 0)
+#define TESTMOD_IOCBUFFERGET    _IO(TESTMOD_IOC_MAGIC, 1)
+#define TESTMOD_IOC_MAXNR 2
 
 MODULE_AUTHOR( "Yevhen" );
 MODULE_LICENSE("GPL");
 
-#define TESTMOD_MAJOR 0      /* dynamic major by default */
-#define TESTMOD_NR_DEVS 3    /* testmod0 through testmod3 */
-#define BUFFER_SIZE 1024   /* requirement */
 
 /*
  * Ioctl definitions
  */
 
-#define TESTMOD_IOC_MAGIC  82
-
-#define TESTMOD_IOCBUFFERRESET    _IO(TESTMOD_IOC_MAGIC, 0)
-#define TESTMOD_IOCBUFFERGET    _IO(TESTMOD_IOC_MAGIC, 1)
-
-
-#define TESTMOD_IOC_MAXNR 2
 
 struct my_buffer
 {
@@ -85,7 +84,6 @@ static struct file_operations testmod_fops = {
 };
 
 
-static void testmod_cleanup_module(void);
 static void setup_cdev(struct my_device *dev, int count) {
 
   int err, devno = testmod_p_devno + count;
@@ -231,6 +229,7 @@ static int testmod_release( struct inode *inode, struct file *filp ) {
 
 	struct my_device *dev = filp->private_data;
 	
+        down(&dev->sem);
 	if (filp->f_mode & FMODE_READ) {
 	  dev->wbuf->numreaders--;
 	}
@@ -250,10 +249,12 @@ static ssize_t testmod_read( struct file *filp,
     size_t count,   /* The max number of bytes to read  */
     loff_t *f_pos )  /* The offset in the file           */
 {
+	printk(KERN_INFO "count: %d f_pos: %d\n", count, *f_pos);
 	
 	int data = 0;
+	unsigned long rval;
 	struct my_device *dev = filp->private_data;
-	size_t cnt = strlen(dev->wbuf->buffer), ret;
+	size_t cnt;
 	
 	
 	if(down_interruptible(&(dev->wbuf->sem))) {
@@ -261,6 +262,7 @@ static ssize_t testmod_read( struct file *filp,
 	}
 
 	while (dev->wbuf->count == 0) {
+	  printk(KERN_INFO "TESTMOD: Buffer is empty.\n");
 	  /* buffer is empty, sleep */
 	  up(&(dev->wbuf->sem));
 	  wake_up_interruptible(&(dev->wbuf->queue));
@@ -276,21 +278,22 @@ static ssize_t testmod_read( struct file *filp,
 	  return -ERESTARTSYS;
 	  }
 	}
+       
+        if (count > (dev->wbuf->count - *f_pos))
+		count = dev->wbuf->count - *f_pos;
+	rval = copy_to_user(buf, dev->wbuf->buffer + *f_pos, count);
+        if (rval < 0)
+		return -EFAULT;
+	cnt = count - rval;
+	*f_pos += cnt;
 
-        ret = copy_to_user(buf, dev->wbuf->buffer, cnt);
-	*f_pos += cnt - ret;
-
+	printk(KERN_INFO "count: %d f_pos: %d cnt: %d.\n", count, *f_pos, cnt);
 
 	up(&(dev->wbuf->sem));
 	/* Data has been cleared from buffer! Wake sleeping processes */
 	wake_up_interruptible(&(dev->wbuf->queue));
-	
-	//return count;
-	//
-	if(*f_pos > cnt)
-		return 0;
-	else
-		return cnt;
+
+	return cnt;
 }
 
 
