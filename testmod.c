@@ -8,6 +8,7 @@
 #include <linux/wait.h>
 #include <linux/uaccess.h>
 #include <linux/semaphore.h>
+#include <linux/list.h>
 
 #include <asm/switch_to.h>
 #include <linux/cdev.h>
@@ -32,7 +33,8 @@ long testmod_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 #define TESTMOD_IOC_MAGIC  82
 #define TESTMOD_IOCBUFFERRESET    _IO(TESTMOD_IOC_MAGIC, 0)
 #define TESTMOD_IOCBUFFERGET    _IO(TESTMOD_IOC_MAGIC, 1)
-#define TESTMOD_IOC_MAXNR 2
+#define TESTMOD_IOCLASTSTRDROP    _IO(TESTMOD_IOC_MAGIC, 2)
+#define TESTMOD_IOC_MAXNR 3
 
 MODULE_AUTHOR( "Yevhen" );
 MODULE_LICENSE("GPL");
@@ -42,21 +44,26 @@ MODULE_LICENSE("GPL");
  * Ioctl definitions
  */
 
+struct my_message                 /* String tracking */
+{ 
+  unsigned int str_startpos;
+  unsigned int str_endpos;                  /* Needed in case of non-nulltermonated str */
+  struct list_head list;
+};
 
 struct my_buffer
 {
-    char *buffer, *end;           /* pointers to the beginning and end of the buffer */
+    char *buffer, *end;             /* pointers to the beginning and end of the buffer */
     int buffersize;
-    int count;                    /* keeps track of how far into the buffer we are */ 
-    int wp;                   
-    int numreaders, numwriters;   /* number of readers and writers */
+    int count;                      /* keeps track of how far into the buffer we are */ 
+    int numreaders, numwriters;     /* number of readers and writers */
     struct semaphore sem;
-    wait_queue_head_t queue;      /* queue of sleeping processes waiting for access to buffer */
+    struct list_head strlist_head;  /* list for buffer indexing */
+    wait_queue_head_t queue;        /* queue of sleeping processes waiting for access to buffer */
 };
 
-
 struct my_device {
-  struct my_buffer *rbuf, *wbuf;
+  struct my_buffer *wbuf;
   struct semaphore sem;
   struct cdev cdev;
 };
@@ -72,6 +79,7 @@ static struct my_device *testmod_device;
 static struct device* my_device = NULL;
 static struct class* my_class = NULL;
 static struct my_buffer *buffers;
+LIST_HEAD(messageList);
 
 /* file operations struct */
 static struct file_operations testmod_fops = {
@@ -150,6 +158,7 @@ int testmod_init_module( void ) {
   
   for (i = 0; i < testmod_nr_devs; i++) {
     buffers[i].buffer = kmalloc(dev_buffer_size, GFP_KERNEL);
+    //buffers[i].strlist = kmalloc(sizeof(struct my_message), GFP_KERNEL);
     memset(buffers[i].buffer, 0, dev_buffer_size*sizeof(char));
     setup_cdev(&testmod_device[i], i);
     if (!buffers[i].buffer) {
@@ -158,11 +167,11 @@ int testmod_init_module( void ) {
       return -ENOMEM;
     }
     buffers[i].count = 0;
-    buffers[i].wp = 0;
     buffers[i].numwriters = 0;
     buffers[i].numreaders = 0;
     buffers[i].buffersize = dev_buffer_size;
     buffers[i].end = buffers[i].buffer + buffers[i].buffersize;
+    INIT_LIST_HEAD(&buffers[i].strlist_head);
     init_waitqueue_head(&buffers[i].queue);
     init_MUTEX(&buffers[i].sem);
     init_MUTEX(&testmod_device[i].sem);
@@ -249,7 +258,6 @@ static ssize_t testmod_read( struct file *filp,
     size_t count,   /* The max number of bytes to read  */
     loff_t *f_pos )  /* The offset in the file           */
 {
-	printk(KERN_INFO "count: %d f_pos: %d\n", count, *f_pos);
 	
 	int data = 0;
 	unsigned long rval;
@@ -287,8 +295,6 @@ static ssize_t testmod_read( struct file *filp,
 	cnt = count - rval;
 	*f_pos += cnt;
 
-	printk(KERN_INFO "count: %d f_pos: %d cnt: %d.\n", count, *f_pos, cnt);
-
 	up(&(dev->wbuf->sem));
 	/* Data has been cleared from buffer! Wake sleeping processes */
 	wake_up_interruptible(&(dev->wbuf->queue));
@@ -305,6 +311,9 @@ static ssize_t testmod_write( struct file *filp,
 
 	int data = 0;
 	struct my_device *dev = filp->private_data;
+	struct my_message *str = kmalloc(sizeof(struct my_message), GFP_KERNEL), *ptr;
+        struct list_head *pos;
+	str->str_startpos = dev->wbuf->count;
 	
 	if(down_interruptible(&(dev->wbuf->sem))) {
 	  return -ERESTARTSYS;
@@ -331,18 +340,38 @@ static ssize_t testmod_write( struct file *filp,
 	    }
 	  }
 	  /* loop and write until there's no more data or no more space, one character at a time */
-	  ret = copy_from_user(dev->wbuf->buffer + dev->wbuf->wp, buf + data, 1);
+	  ret = copy_from_user(dev->wbuf->buffer + dev->wbuf->count, buf + data, 1);
   	if(ret) {
   	  up(&(dev->wbuf->sem));
   	  return -EFAULT;
   	}
   	data++;
-  	dev->wbuf->wp++;
   	dev->wbuf->count++;
-  	if(dev->wbuf->wp == dev_buffer_size) {
-  	  dev->wbuf->wp = 0;
+  	if(dev->wbuf->count == dev_buffer_size) {
+  	  dev->wbuf->count = 0;
   	}
 	}
+	str->str_endpos = dev->wbuf->count;
+	list_add_tail(&str->list, &dev->wbuf->strlist_head);
+
+        /* DEBUG
+	 *
+	 * last
+	ptr = list_last_entry(&dev->wbuf->strlist_head, struct my_message, list);
+	printk(KERN_INFO "entry: %d %d.\n", ptr->str_startpos, ptr->str_endpos);
+        * all
+	list_for_each(pos, &dev->wbuf->strlist_head){
+	ptr = list_entry(pos, struct my_message, list);
+	printk(KERN_INFO "entry: %d %d.\n", qwe);
+	printk(KERN_INFO "entry: %d %d.\n", ptr->str_startpos, ptr->str_endpos);
+	}
+        */
+        char qwe[10];
+	ptr = list_last_entry(&dev->wbuf->strlist_head, struct my_message, list);
+	printk(KERN_INFO "entry: %d %d.\n", ptr->str_startpos, ptr->str_endpos);
+	//memcpy(qwe, dev->wbuf->buffer + ptr->str_startpos, (ptr->str_endpos - ptr->str_startpos)); 
+        //printk(KERN_INFO "Removing entry qwe: %s\n", qwe);
+
 	up(&(dev->wbuf->sem));
 	/* data has been written to buffer, wake up any processes */
 	wake_up_interruptible(&dev->wbuf->queue);
@@ -356,6 +385,8 @@ long testmod_ioctl(
     unsigned long arg ) /* argument of the command */
 {
 	struct my_device *dev = filp->private_data;
+	struct my_message *ptr;
+
 	printk(KERN_INFO "TESTMOD: ioctl called.\n");
 	int i;
 	int err = 0;
@@ -372,7 +403,6 @@ long testmod_ioctl(
     case TESTMOD_IOCBUFFERRESET:    /* reset buffer */
           printk(KERN_NOTICE "Clearing buffer\n");
           dev->wbuf->count = 0;
-          dev->wbuf->wp = 0;
           dev->wbuf->numwriters = 0;
           dev->wbuf->numreaders = 0;
           dev->wbuf->buffersize = dev_buffer_size;
@@ -386,6 +416,13 @@ long testmod_ioctl(
       printk(KERN_NOTICE "Buffer size: %d\n", (dev->wbuf->buffersize - dev->wbuf->count));
       return (dev->wbuf->buffersize - dev->wbuf->count);
       
+    case TESTMOD_IOCLASTSTRDROP:
+       ptr = list_last_entry(&dev->wbuf->strlist_head, struct my_message, list);
+       dev->wbuf->count = dev->wbuf->count - (ptr->str_endpos - ptr->str_startpos);
+       memset(dev->wbuf->buffer + ptr->str_startpos, 0, (ptr->str_endpos - ptr->str_startpos));
+       list_del(&ptr->list);
+       kfree(ptr);
+
 	}
 	//return retval;
 
